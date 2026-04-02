@@ -320,6 +320,13 @@ pub(super) fn vertical_swipe_gesture(
         return;
     }
 
+    let switch_virtual = |delta: f64, commands: &mut Commands| {
+        let direction = if delta > 0.0 { Direction::South } else { Direction::North };
+        commands.trigger(SendMessageTrigger(Event::Command {
+            command: Command::Window(Operation::Virtual(direction)),
+        }));
+    };
+
     const GESTURE_TIMEOUT: Duration = Duration::from_millis(150);
 
     // Reset state when the gesture times out (fingers lifted).
@@ -330,42 +337,45 @@ pub(super) fn vertical_swipe_gesture(
         state.fired = false;
     }
 
-    // Already fired for this gesture. Drain the reader to advance its cursor
-    // but only update timing so the timeout tracks the real gesture end.
+    // Already fired for this trackpad gesture. Drain the reader to advance
+    // its cursor but only update timing so the timeout tracks the real gesture end.
+    // Scroll wheel ticks still fire since each tick is independent.
     if state.fired {
         for event in messages.read() {
-            if matches!(event, Event::VerticalSwipe { .. }) {
-                state.last_event = Some(Instant::now());
+            match event {
+                Event::VerticalScrollTick { delta } => {
+                    switch_virtual(*delta, &mut commands);
+                }
+                Event::VerticalSwipe { .. } => {
+                    state.last_event = Some(Instant::now());
+                }
+                _ => {}
             }
         }
         return;
     }
 
-    // Threshold for triggering a virtual workspace switch.
-    // Needs to be high enough that incidental vertical movement during
-    // horizontal swipes doesn't trigger a workspace switch.
-    let threshold = 0.15 / config.config().swipe_sensitivity();
-
     for event in messages.read() {
-        let delta = match event {
-            Event::VerticalSwipe { delta } => *delta,
-            _ => continue,
-        };
-
-        state.accumulated += delta;
-        state.last_event = Some(Instant::now());
+        match event {
+            Event::VerticalScrollTick { delta } => {
+                switch_virtual(*delta, &mut commands);
+            }
+            Event::VerticalSwipe { delta } => {
+                state.accumulated += delta;
+                state.last_event = Some(Instant::now());
+            }
+            _ => {}
+        }
     }
 
-    if state.accumulated.abs() >= threshold {
-        let direction = if state.accumulated > 0.0 {
-            Direction::South
-        } else {
-            Direction::North
-        };
-        commands.trigger(SendMessageTrigger(Event::Command {
-            command: Command::Window(Operation::Virtual(direction)),
-        }));
-        state.accumulated = 0.0;
-        state.fired = true;
+    if state.accumulated != 0.0 {
+        // Threshold needs to be high enough that incidental vertical movement
+        // during horizontal swipes doesn't trigger a workspace switch.
+        let threshold = 0.15 / config.config().swipe_sensitivity();
+        if state.accumulated.abs() >= threshold {
+            switch_virtual(state.accumulated, &mut commands);
+            state.accumulated = 0.0;
+            state.fired = true;
+        }
     }
 }

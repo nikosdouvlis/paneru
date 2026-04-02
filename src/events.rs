@@ -73,8 +73,11 @@ pub enum Event {
     /// A swipe gesture has been detected.
     Swipe { deltas: Vec<f64> },
 
-    /// A vertical swipe gesture has been detected.
+    /// A vertical trackpad gesture (accumulates delta to threshold before firing).
     VerticalSwipe { delta: f64 },
+
+    /// A single scroll wheel tick for vertical workspace switching (fires immediately).
+    VerticalScrollTick { delta: f64 },
 
     /// A mouse scroll has been detected.
     Scroll { delta: f64 },
