@@ -668,7 +668,9 @@ fn to_next_display(
         reshuffle_around(neighbour, &mut commands);
     }
 
-    if matches!(move_focus, MoveFocus::Stay) && let Some(neighbour) = source_neighbour {
+    if matches!(move_focus, MoveFocus::Stay)
+        && let Some(neighbour) = source_neighbour
+    {
         commands.entity(entity).remove::<FocusedMarker>();
         commands.entity(neighbour).try_insert(FocusedMarker);
     }
