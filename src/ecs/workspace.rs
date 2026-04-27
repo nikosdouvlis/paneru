@@ -15,8 +15,8 @@ use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, NativeFullscreenMarker, Position, RefreshWindowSizes,
-    SelectedVirtualMarker, Timeout, Unmanaged, flash_message, focus_entity, reposition_entity,
-    reshuffle_around,
+    SelectedVirtualMarker, SleepInProgress, Timeout, Unmanaged, flash_message, focus_entity,
+    reposition_entity, reshuffle_around,
 };
 use crate::errors::Result;
 use crate::events::Event;
@@ -314,8 +314,16 @@ pub(super) fn find_orphaned_workspaces(
     orphans: Populated<(&LayoutStrip, Entity, &Timeout, Option<&ChildOf>), With<Timeout>>,
     displays: Query<(&Display, Entity)>,
     window_manager: Res<WindowManager>,
+    sleep: Option<Res<SleepInProgress>>,
     mut commands: Commands,
 ) {
+    // Skip the destructive timeout branch while sleep state is in flight. The
+    // wake reconciler will clear `SleepInProgress` after re-anchoring active
+    // markers and refreshing strip membership; until then any orphan strip
+    // that's about to be reparented stays untouched.
+    if sleep.is_some() {
+        return;
+    }
     let present = window_manager.present_displays();
 
     for (orphan, orphan_entity, timeout, child) in orphans {

@@ -89,6 +89,19 @@ define_class!(
             _ = self.ivars().events.send(msg);
         }
 
+        /// Called just before the system goes to sleep.
+        ///
+        /// # Arguments
+        ///
+        /// * `notification` - The notification object.
+        #[unsafe(method(willSleep:))]
+        fn system_will_sleep(&self, notification: &NSObject) {
+            let msg = Event::SystemWillSleep{
+                msg: format!("WorkspaceObserver: {notification:?}"),
+            };
+            _ = self.ivars().events.send(msg);
+        }
+
         /// Called when the system wakes from sleep.
         ///
         /// # Arguments
@@ -246,6 +259,7 @@ impl WorkspaceObserver {
                 sel!(didUnhideApplication:),
                 "NSWorkspaceDidUnhideApplicationNotification",
             ),
+            (sel!(willSleep:), "NSWorkspaceWillSleepNotification"),
             (sel!(didWake:), "NSWorkspaceDidWakeNotification"),
         ];
         let shared_ws = NSWorkspace::sharedWorkspace();

@@ -85,6 +85,9 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 REFRESH_WINDOW_CHECK_FREQ_MS,
             ))),
             systems::displays_rearranged,
+            systems::wake_reconcile
+                .after(systems::displays_rearranged)
+                .run_if(resource_exists::<WakeReconcilePending>),
             systems::reposition_dragged_window,
             workspace::show_active_workspace,
             workspace::cleanup_virtual_workspaces,
@@ -406,6 +409,72 @@ pub struct PollForNotifications;
 
 #[derive(PartialEq, Resource)]
 pub struct Initializing;
+
+/// Set while the system is between `SystemWillSleep` and the next `SystemWoke`.
+/// Gates work that would otherwise run on stale state across the sleep boundary
+/// (most notably the orphan-strip rescue, which would otherwise float every
+/// secondary-display window if wake takes longer than 30 seconds).
+///
+/// `entered_at` lets a watchdog auto-clear the resource if no wake signal ever
+/// arrives, so a stuck sleep notification can't permanently disable
+/// `timeout_ticker` and other systems that gate on this resource.
+#[derive(Resource)]
+pub struct SleepInProgress {
+    pub entered_at: Instant,
+}
+
+impl SleepInProgress {
+    /// Upper bound on how long sleep state can stay set without a wake signal
+    /// before the watchdog clears it. Real sleeps last seconds to hours, but
+    /// notifications can in theory be lost; this caps the blast radius.
+    pub const WATCHDOG: Duration = Duration::from_secs(120);
+
+    pub fn fresh() -> Self {
+        Self {
+            entered_at: Instant::now(),
+        }
+    }
+
+    pub fn watchdog_expired(&self) -> bool {
+        self.entered_at.elapsed() >= Self::WATCHDOG
+    }
+}
+
+/// Set when wake-related events arrive. The reconcile system consumes it after
+/// a short quiet window has elapsed since the last wake signal, so a flurry of
+/// `DisplayConfigured` / `DisplayResized` / `SystemWoke` events coalesces into
+/// a single reconciliation pass.
+#[derive(Resource)]
+pub struct WakeReconcilePending {
+    last_signal: Instant,
+    first_signal: Instant,
+}
+
+impl WakeReconcilePending {
+    /// Quiet window: reconcile runs once no new wake signal has arrived for this long.
+    pub const QUIET_WINDOW: Duration = Duration::from_millis(500);
+    /// Hard ceiling: reconcile runs no later than this after the first wake signal,
+    /// even if wake events keep arriving (e.g. flaky USB-C dock).
+    pub const MAX_DEADLINE: Duration = Duration::from_secs(3);
+
+    pub fn fresh() -> Self {
+        let now = Instant::now();
+        Self {
+            last_signal: now,
+            first_signal: now,
+        }
+    }
+
+    pub fn bump(&mut self) {
+        self.last_signal = Instant::now();
+    }
+
+    pub fn ready(&self) -> bool {
+        let now = Instant::now();
+        now.duration_since(self.last_signal) >= Self::QUIET_WINDOW
+            || now.duration_since(self.first_signal) >= Self::MAX_DEADLINE
+    }
+}
 
 /// Bevy event trigger for general window manager events.
 #[derive(BevyEvent)]

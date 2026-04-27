@@ -50,6 +50,8 @@ impl NotifyHandler {
             KnownCGSEvent::SpaceCreated,
             KnownCGSEvent::SpaceCurrentChanged,
             KnownCGSEvent::SpaceDestroyed,
+            KnownCGSEvent::DisplayWillSleep,
+            KnownCGSEvent::DisplayDidWake,
         ];
         for event in events {
             unsafe {
@@ -105,6 +107,17 @@ impl NotifyHandler {
                         }
                     }
                 }
+            }
+
+            KnownCGSEvent::DisplayWillSleep => {
+                _ = self.events.send(Event::SystemWillSleep {
+                    msg: "SLS DisplayWillSleep".into(),
+                });
+            }
+            KnownCGSEvent::DisplayDidWake => {
+                _ = self.events.send(Event::SystemWoke {
+                    msg: "SLS DisplayDidWake".into(),
+                });
             }
 
             KnownCGSEvent::SpaceWindowDestroyed | KnownCGSEvent::SpaceWindowCreated => {

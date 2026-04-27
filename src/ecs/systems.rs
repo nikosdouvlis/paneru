@@ -12,7 +12,7 @@ use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
 use objc2_core_graphics::CGDirectDisplayID;
 use objc2_foundation::NSPoint;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -20,8 +20,8 @@ use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
     ActiveDisplayMarker, BProcess, ExistingMarker, FocusedMarker, FreshMarker,
-    PollForNotifications, RepositionMarker, ResizeMarker, RetryFrontSwitch, SpawnWindowTrigger,
-    Timeout, WMEventTrigger,
+    PollForNotifications, RepositionMarker, ResizeMarker, RetryFrontSwitch, SleepInProgress,
+    SpawnWindowTrigger, Timeout, WMEventTrigger, WakeReconcilePending,
 };
 
 use crate::config::{Config, decorations::BorderRadiusOption};
@@ -57,6 +57,18 @@ pub(super) fn dispatch_toplevel_triggers(
     mut commands: Commands,
 ) {
     for event in messages.read() {
+        if matches!(
+            event,
+            Event::DisplayAdded { .. }
+                | Event::DisplayRemoved { .. }
+                | Event::DisplayMoved { .. }
+                | Event::DisplayResized { .. }
+                | Event::DisplayConfigured { .. }
+                | Event::SystemWoke { .. }
+        ) {
+            arm_wake_reconcile(&mut commands);
+        }
+
         match event {
             Event::WindowCreated { element } => {
                 if let Ok(window) = WindowOS::new(element)
@@ -91,13 +103,35 @@ pub(super) fn dispatch_toplevel_triggers(
             Event::DisplayConfigured { display_id } => {
                 debug!("Display Configured: {display_id:?}");
             }
+            Event::SystemWillSleep { msg } => {
+                debug!("system will sleep: {msg:?}");
+                commands.insert_resource(SleepInProgress::fresh());
+            }
             Event::SystemWoke { msg } => {
                 debug!("system woke: {msg:?}");
+                // Re-arm the polling fallback. The first `Event::SpaceChanged`
+                // after settling will disable it again. `SleepInProgress` is
+                // cleared by `wake_reconcile` once reconciliation completes,
+                // not here, so orphan-strip rescue stays paused across the
+                // huge `Time::delta` of the first post-wake tick.
+                commands.insert_resource(PollForNotifications);
             }
 
             _ => commands.trigger(WMEventTrigger(event.clone())),
         }
     }
+}
+
+/// Inserts or bumps the `WakeReconcilePending` resource so the wake reconcile
+/// system runs once after the wake-event flurry settles.
+fn arm_wake_reconcile(commands: &mut Commands) {
+    commands.queue(|world: &mut bevy::ecs::world::World| {
+        if let Some(mut pending) = world.get_resource_mut::<WakeReconcilePending>() {
+            pending.bump();
+        } else {
+            world.insert_resource(WakeReconcilePending::fresh());
+        }
+    });
 }
 
 /// Gathers all present displays and spawns them as entities in the Bevy world.
@@ -445,8 +479,22 @@ pub(super) fn fresh_marker_cleanup(
 pub(super) fn timeout_ticker(
     timers: Populated<(Entity, &mut Timeout)>,
     clock: Res<Time>,
+    sleep: Option<Res<SleepInProgress>>,
     mut commands: Commands,
 ) {
+    // Pause all `Timeout` work across the sleep boundary so the huge
+    // `Time::delta` on the first post-wake tick doesn't fast-forward (and
+    // immediately despawn) orphan-strip rescues. The watchdog auto-clears the
+    // resource if no wake signal ever arrives, so a missing wake notification
+    // can't keep the gate held forever.
+    if let Some(sleep) = sleep.as_deref() {
+        if sleep.watchdog_expired() {
+            warn!("sleep watchdog expired without wake signal; resuming timeouts");
+            commands.remove_resource::<SleepInProgress>();
+        } else {
+            return;
+        }
+    }
     for (entity, mut timeout) in timers {
         if timeout.timer.is_finished() {
             trace!("Despawning entity {entity} due to timeout.");
@@ -939,6 +987,144 @@ fn move_display(
         existing_strips,
         commands,
     );
+}
+
+/// Reconciles ECS state with macOS after a wake-related event flurry.
+///
+/// macOS often signals wake via `DisplayResized` or `DisplayConfigured` rather
+/// than `DisplayAdded`/`Removed`/`Moved`, and `SystemWoke` itself was a no-op
+/// before this system existed. The result was that strip-to-window membership
+/// and the `ActiveDisplayMarker` / `ActiveWorkspaceMarker` could drift across a
+/// sleep cycle without anything in paneru noticing.
+///
+/// The reconciler is gated on `WakeReconcilePending`, which is armed by every
+/// wake-related arm of `dispatch_toplevel_triggers`. It waits for a short quiet
+/// window after the last wake signal so the burst of events macOS emits during
+/// a wake settles before we mutate ECS state.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn wake_reconcile(
+    pending: Option<Res<WakeReconcilePending>>,
+    mut workspaces: Query<(&mut LayoutStrip, Entity, Option<&ChildOf>)>,
+    displays: Query<(&Display, Entity)>,
+    windows: Windows,
+    window_manager: Res<WindowManager>,
+    mut commands: Commands,
+) {
+    let Some(pending) = pending else {
+        return;
+    };
+    if !pending.ready() {
+        return;
+    }
+
+    let stale = pending.first_signal.elapsed() >= WakeReconcilePending::MAX_DEADLINE;
+
+    let active_display_id = match window_manager.active_display_id() {
+        Ok(id) => id,
+        Err(err) => {
+            if stale {
+                warn!("wake reconcile: active_display_id unavailable: {err}, giving up");
+                commands.remove_resource::<WakeReconcilePending>();
+                commands.remove_resource::<SleepInProgress>();
+            }
+            return;
+        }
+    };
+    let active_workspace_id = match window_manager.active_display_space(active_display_id) {
+        Ok(id) => id,
+        Err(err) => {
+            if stale {
+                warn!("wake reconcile: active_display_space unavailable: {err}, giving up");
+                commands.remove_resource::<WakeReconcilePending>();
+                commands.remove_resource::<SleepInProgress>();
+            }
+            return;
+        }
+    };
+
+    debug!(
+        "wake reconcile: active_display={active_display_id}, active_workspace={active_workspace_id}"
+    );
+
+    for (display, entity) in &displays {
+        if display.id() == active_display_id {
+            commands.entity(entity).try_insert(ActiveDisplayMarker);
+        } else {
+            commands.entity(entity).try_remove::<ActiveDisplayMarker>();
+        }
+    }
+
+    for (strip, entity, _) in workspaces.iter() {
+        if strip.id() == active_workspace_id && strip.virtual_index == 0 {
+            commands.entity(entity).try_insert(ActiveWorkspaceMarker);
+        } else {
+            commands
+                .entity(entity)
+                .try_remove::<ActiveWorkspaceMarker>();
+        }
+    }
+
+    // Snapshot per-workspace_id window lists from macOS, once. Grouping by
+    // `WorkspaceId` is load-bearing: virtual rows share an id but macOS only
+    // knows the flat per-id membership, so a per-strip refresh against
+    // `windows_in_workspace` would duplicate windows across virtual rows.
+    let workspace_ids: HashSet<WorkspaceId> =
+        workspaces.iter().map(|(strip, _, _)| strip.id()).collect();
+
+    let mut workspace_windows: HashMap<WorkspaceId, HashSet<Entity>> = HashMap::new();
+    let mut all_workspaces_resolved = true;
+    for ws_id in workspace_ids {
+        match window_manager.windows_in_workspace(ws_id) {
+            Ok(win_ids) => {
+                let entities = win_ids
+                    .into_iter()
+                    .filter_map(|id| windows.find_managed(id).map(|(_, e)| e))
+                    .collect::<HashSet<_>>();
+                workspace_windows.insert(ws_id, entities);
+            }
+            Err(err) => {
+                debug!("wake reconcile: windows_in_workspace({ws_id}): {err}");
+                all_workspaces_resolved = false;
+            }
+        }
+    }
+
+    for (mut strip, _, _) in &mut workspaces {
+        let Some(target) = workspace_windows.get(&strip.id()) else {
+            continue;
+        };
+
+        // Drop entities macOS no longer reports in this workspace from every
+        // strip that shares the id, including virtual rows. macOS knows
+        // nothing about `virtual_index`, so a window that left the workspace
+        // can otherwise sit forever in a virtual row.
+        let to_remove: Vec<Entity> = strip
+            .all_windows()
+            .into_iter()
+            .filter(|entity| !target.contains(entity))
+            .collect();
+        for entity in to_remove {
+            strip.remove(entity);
+        }
+
+        if strip.virtual_index == 0 {
+            for &entity in target {
+                if !strip.contains(entity) {
+                    strip.append(entity);
+                }
+            }
+        }
+    }
+
+    // If any `windows_in_workspace` lookup failed and we still have time, leave
+    // the resources in place so the next tick retries against fresh macOS data
+    // instead of locking in a half-reconciled state.
+    if !all_workspaces_resolved && !stale {
+        return;
+    }
+
+    commands.remove_resource::<WakeReconcilePending>();
+    commands.remove_resource::<SleepInProgress>();
 }
 
 fn reparent_existing_workspaces(
