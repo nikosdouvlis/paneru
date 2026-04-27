@@ -501,7 +501,12 @@ impl WindowManagerApi for WindowManagerOS {
 
     /// Returns a list of windows in a given workspace.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>> {
-        space_window_list_for_connection(self.main_cid, &[space_id], None, true)
+        let result = space_window_list_for_connection(self.main_cid, &[space_id], None, true);
+        match &result {
+            Ok(wins) => info!("windows_in_workspace({space_id}) -> {wins:?}"),
+            Err(err) => info!("windows_in_workspace({space_id}) -> Err({err})"),
+        }
+        result
     }
 
     fn quit(&self) -> Result<()> {

@@ -265,7 +265,11 @@ pub(crate) fn finish_setup(
     );
 
     for (mut strip, active_strip) in &mut workspaces {
-        debug!("space {}: before refresh {strip:?}", strip.id());
+        info!(
+            "finish_setup: strip space={} active={active_strip} before={:?}",
+            strip.id(),
+            strip.all_windows()
+        );
         let workspace_windows = window_manager
             .windows_in_workspace(strip.id())
             .inspect_err(|err| {
@@ -287,8 +291,20 @@ pub(crate) fn finish_setup(
                     .collect::<Vec<_>>()
             });
         let Some(workspace_windows) = workspace_windows else {
+            info!(
+                "finish_setup: strip space={} skipped (no windows resolved)",
+                strip.id()
+            );
             continue;
         };
+        info!(
+            "finish_setup: strip space={} resolved_windows={:?}",
+            strip.id(),
+            workspace_windows
+                .iter()
+                .map(|(w, e)| (w.id(), *e))
+                .collect::<Vec<_>>()
+        );
 
         // Preserve the order - do not flush existing windows.
         for entity in strip.all_windows() {
@@ -301,7 +317,11 @@ pub(crate) fn finish_setup(
                 strip.append(entity);
             }
         }
-        debug!("space {}: after refresh {strip:?}", strip.id());
+        info!(
+            "finish_setup: strip space={} after={:?}",
+            strip.id(),
+            strip.all_windows()
+        );
 
         if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
             focus_entity(entity, true, &mut commands);
