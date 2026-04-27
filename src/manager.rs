@@ -16,7 +16,7 @@ use std::ptr::null_mut;
 use std::slice::from_raw_parts_mut;
 use std::time::Duration;
 use stdext::function_name;
-use tracing::{Level, debug, error, instrument, trace, warn};
+use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
@@ -222,6 +222,24 @@ impl WindowManagerOS {
             )))?;
         let uuid = uuid.to_string();
 
+        // DIAGNOSTIC: dump the full SLS payload so we can see exactly which
+        // identifiers macOS reports for each display on this machine.
+        let identifiers: Vec<String> = display_spaces
+            .iter()
+            .map(|display| {
+                display
+                    .get(&CFString::from_static_str("Display Identifier"))
+                    .map_or_else(|| "<missing>".into(), |id| id.to_string())
+            })
+            .collect();
+        let active = self
+            .active_display_uuid()
+            .ok()
+            .map_or_else(|| "<unavailable>".into(), |u| u.to_string());
+        info!(
+            "display_space_list query: uuid='{uuid}' active='{active}' SLS-reported identifiers={identifiers:?}"
+        );
+
         let display = display_spaces.iter().find(|display| {
             let identifier = display
                 .get(&CFString::from_static_str("Display Identifier"))
@@ -232,12 +250,19 @@ impl WindowManagerOS {
             })
         });
         let Some(display) = display else {
+            info!("display_space_list: no entry matched query '{uuid}'");
             return Err(Error::PermissionDenied(format!(
                 "could not get any displays for {}",
                 self.main_cid
             )));
         };
-        debug!("found display with uuid '{uuid}'");
+
+        let matched_identifier = display
+            .get(&CFString::from_static_str("Display Identifier"))
+            .map_or_else(|| "<missing>".into(), |id| id.to_string());
+        info!(
+            "display_space_list: matched entry identifier='{matched_identifier}' for query '{uuid}'"
+        );
 
         let display = unsafe {
             display.cast_unchecked::<CFString, CFArray<CFDictionary<CFString, CFNumber>>>()
@@ -256,13 +281,8 @@ impl WindowManagerOS {
                     .and_then(|id| id.as_i64().and_then(|value| u64::try_from(value).ok()))
             })
             .collect::<Vec<WorkspaceId>>();
-        debug!(
-            "spaces [{}]",
-            spaces
-                .iter()
-                .map(|id| format!("{id}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+        info!(
+            "display_space_list: query='{uuid}' matched='{matched_identifier}' spaces={spaces:?}"
         );
         Ok(spaces)
     }
