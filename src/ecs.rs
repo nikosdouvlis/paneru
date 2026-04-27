@@ -135,10 +135,14 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PostUpdate,
         (
-            (systems::animate_entities, systems::commit_window_position).chain(),
+            (
+                systems::animate_entities,
+                systems::commit_window_position.run_if(not(resource_exists::<Initializing>)),
+            )
+                .chain(),
             (
                 systems::animate_resize_entities,
-                systems::commit_window_size,
+                systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
             (
