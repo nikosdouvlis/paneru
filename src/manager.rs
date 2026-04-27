@@ -223,14 +223,29 @@ impl WindowManagerOS {
         let uuid = uuid.to_string();
 
         let display = display_spaces.iter().find(|display| {
-            let identifier = display
+            display
                 .get(&CFString::from_static_str("Display Identifier"))
-                .map(|name| name.to_string());
-            identifier.is_some_and(|identifier| {
-                // FIXME: Sometimes the main display simply has the name 'Main'.
-                identifier == "Main" || identifier == uuid
-            })
+                .map(|identifier| identifier.to_string())
+                .is_some_and(|identifier| identifier == uuid)
         });
+
+        // Some SLS responses report the main display under "Main" instead of
+        // its UUID. Apply that fallback only when the caller is asking about
+        // the active main display, otherwise the main display's space list
+        // bleeds into queries for every secondary display.
+        let display = match display {
+            Some(display) => Some(display),
+            None if self.active_display_uuid()?.to_string() == uuid => {
+                display_spaces.iter().find(|display| {
+                    display
+                        .get(&CFString::from_static_str("Display Identifier"))
+                        .map(|identifier| identifier.to_string())
+                        .is_some_and(|identifier| identifier == "Main")
+                })
+            }
+            None => None,
+        };
+
         let Some(display) = display else {
             return Err(Error::PermissionDenied(format!(
                 "could not get any displays for {}",
